@@ -13,6 +13,7 @@ const pool = process.env.DATABASE_URL ? new Pool({
   idleTimeoutMillis: 30000
 }) : null;
 const allowedOrigins = (process.env.CORS_ORIGINS || '').split(',').map(v => v.trim()).filter(Boolean);
+const DOC_KINDS = new Set(['development', 'finances', 'progress', 'preferences']);
 const sqlDir = fileURLToPath(new URL('../sql/', import.meta.url));
 let ready = false;
 
@@ -65,6 +66,29 @@ function validateTelegram(initData) {
   } catch { return null; }
 }
 
+async function authenticatedUser(req) {
+  const telegramUser = validateTelegram(req.headers['x-telegram-init-data']);
+  if (!telegramUser) return null;
+  const result = await pool.query(`INSERT INTO users (telegram_id, first_name, last_name, username, language_code)
+    VALUES ($1,$2,$3,$4,$5) ON CONFLICT (telegram_id)
+    DO UPDATE SET first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name,
+      username=EXCLUDED.username, language_code=EXCLUDED.language_code, updated_at=now()
+    RETURNING id, telegram_id, first_name, username, created_at`,
+    [telegramUser.id, telegramUser.first_name ?? null, telegramUser.last_name ?? null,
+     telegramUser.username ?? null, telegramUser.language_code ?? null]);
+  return result.rows[0];
+}
+async function readJsonBody(req) {
+  let size=0; const chunks=[];
+  for await (const chunk of req) {
+    size+=chunk.length;
+    if (size > 2_000_000) {const error = new Error('Payload too large'); error.status=413; throw error;}
+    chunks.push(chunk);
+  }
+  try {return JSON.parse(Buffer.concat(chunks).toString('utf8'));}
+  catch {const error=new Error('Invalid JSON'); error.status=400; throw error;}
+}
+
 const server = http.createServer(async (req, res) => {
   const origin = req.headers.origin;
   const cors = allowedOrigins.includes(origin) ? { 'access-control-allow-origin': origin, 'vary': 'Origin' } : {};
@@ -72,31 +96,55 @@ const server = http.createServer(async (req, res) => {
     const pathname = new URL(req.url, 'http://localhost').pathname;
     if (req.method === 'OPTIONS') {
       if (!Object.keys(cors).length) return json(res, 403, {error:'Origin not allowed'});
-      res.writeHead(204, {...cors, 'access-control-allow-methods':'GET, OPTIONS', 'access-control-allow-headers':'X-Telegram-Init-Data, Content-Type', 'access-control-max-age':'600'});
+      res.writeHead(204, {...cors, 'access-control-allow-methods':'GET, PUT, OPTIONS', 'access-control-allow-headers':'X-Telegram-Init-Data, Content-Type', 'access-control-max-age':'600'});
       res.end(); return;
     }
-    if (req.method === 'GET' && pathname === '/') return json(res, 200, {service:'skillup-api', version:'0.1.0', status:ready ? 'ready' : 'starting'}, cors);
+    if (req.method === 'GET' && pathname === '/') return json(res, 200, {service:'skillup-api', version:'0.2.0', status:ready ? 'ready' : 'starting'}, cors);
     if (req.method === 'GET' && pathname === '/health') {
       if (!ready) return json(res, 503, {status:'unavailable'}, cors);
       try { await pool.query('SELECT 1'); return json(res, 200, {status:'ok', database:'connected'}, cors); }
       catch { return json(res, 503, {status:'unavailable', database:'disconnected'}, cors); }
     }
-    if (req.method === 'GET' && pathname === '/api/v1/me') {
+    if (pathname === '/api/v1/me' || pathname.startsWith('/api/v1/documents/')) {
       if (!ready || !process.env.TELEGRAM_BOT_TOKEN) return json(res, 503, {error:'Service not configured'}, cors);
-      const user = validateTelegram(req.headers['x-telegram-init-data']);
+      const user = await authenticatedUser(req);
       if (!user) return json(res, 401, {error:'Valid Telegram Mini App authorization required'}, cors);
-      const result = await pool.query(`INSERT INTO users (telegram_id, first_name, last_name, username, language_code)
-        VALUES ($1,$2,$3,$4,$5) ON CONFLICT (telegram_id)
-        DO UPDATE SET first_name = EXCLUDED.first_name, last_name=EXCLUDED.last_name,
-          username=EXCLUDED.username, language_code=EXCLUDED.language_code, updated_at=now()
-        RETURNING id, telegram_id, first_name, username, created_at`,
-        [user.id, user.first_name ?? null, user.last_name ?? null, user.username ?? null, user.language_code ?? null]);
-      return json(res, 200, {user:result.rows[0]}, cors);
+      if (pathname === '/api/v1/me' && req.method === 'GET') return json(res, 200, {user}, cors);
+      const match = /^\/api\/v1\/documents\/([a-z]+)$/.exec(pathname);
+      if (!match || !DOC_KINDS.has(match[1])) return json(res, 404, {error:'Not found'}, cors);
+      const kind=match[1];
+      if (req.method === 'GET') {
+        const result=await pool.query('SELECT payload, revision, updated_at FROM user_documents WHERE user_id=$1 AND kind=$2', [user.id,kind]);
+        return json(res, 200, {document:result.rows[0] || null}, cors);
+      }
+      if (req.method === 'PUT') {
+        const body=await readJsonBody(req);
+        if (!body || typeof body !== 'object' || Array.isArray(body) ||
+            !body.payload || typeof body.payload !== 'object' || Array.isArray(body.payload) ||
+            !(body.revision === null || (Number.isSafeInteger(body.revision) && body.revision > 0)))
+          return json(res, 400, {error:'Expected {payload:object, revision:number|null}'}, cors);
+        const client=await pool.connect();
+        try {
+          await client.query('BEGIN');
+          const existing=await client.query('SELECT revision FROM user_documents WHERE user_id=$1 AND kind=$2 FOR UPDATE', [user.id,kind]);
+          if ((!existing.rowCount && body.revision !== null) ||
+              (existing.rowCount && Number(existing.rows[0].revision) !== body.revision)) {
+            await client.query('ROLLBACK');
+            return json(res, 409, {error:'Document revision conflict'}, cors);
+          }
+          let result;
+          if (existing.rowCount) result=await client.query('UPDATE user_documents SET payload=$3::jsonb, revision=revision+1, updated_at=now() WHERE user_id=$1 AND kind=$2 RETURNING revision,updated_at', [user.id,kind,JSON.stringify(body.payload)]);
+          else result=await client.query('INSERT INTO user_documents(user_id,kind,payload) VALUES($1,$2,$3::jsonb) RETURNING revision,updated_at', [user.id,kind,JSON.stringify(body.payload)]);
+          await client.query('COMMIT');
+          return json(res, 200, {revision:Number(result.rows[0].revision),updated_at:result.rows[0].updated_at}, cors);
+        } catch(error){await client.query('ROLLBACK').catch(()=>{});throw error;}
+        finally{client.release();}
+      }
     }
     return json(res, 404, {error:'Not found'}, cors);
   } catch (error) {
     console.error('Request failed:', error.message);
-    return json(res, 500, {error:'Internal server error'});
+    return json(res, error.status || 500, {error: error.status ? error.message : 'Internal server error'}, typeof origin === 'string' && allowedOrigins.includes(origin) ? {'access-control-allow-origin':origin,'vary':'Origin'} : {});
   }
 });
 server.listen(port, '0.0.0.0', async () => {
