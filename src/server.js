@@ -43,27 +43,50 @@ function json(res, status, body, headers = {}) {
   res.writeHead(status, {'content-type':'application/json; charset=utf-8','cache-control':'no-store',...headers});
   res.end(JSON.stringify(body));
 }
+// Security diagnostic codes only. Never log initData, user fields, hashes or secrets.
+function rejectTelegram(reason, signaturePresent = false) {
+  if (process.env.AUTH_DIAGNOSTICS === 'true') {
+    console.warn(`[Telegram Auth] rejected=${reason} signature_present=${signaturePresent}`);
+  }
+  return null;
+}
 function validateTelegram(initData) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token || !initData || initData.length > 16384) return null;
+  if (!token) return rejectTelegram('bot_token_missing');
+  if (typeof initData !== 'string' || !initData) return rejectTelegram('init_data_missing');
+  if (initData.length > 16384) return rejectTelegram('init_data_too_large');
   const params = new URLSearchParams(initData);
+  const hasSignature = params.has('signature');
   const hash = params.get('hash');
-  const authDate = Number(params.get('auth_date'));
-  if (!hash || !/^[a-f\d]{64}$/i.test(hash) || !Number.isSafeInteger(authDate)) return null;
+  const authRaw = params.get('auth_date');
+  const authDate = authRaw && /^\d+$/.test(authRaw) ? Number(authRaw) : NaN;
+  if (!hash || !/^[a-f\d]{64}$/i.test(hash)) return rejectTelegram('hash_missing_or_invalid', hasSignature);
+  if (!Number.isSafeInteger(authDate)) return rejectTelegram('auth_date_invalid', hasSignature);
   const ageSeconds = Math.floor(Date.now() / 1000) - authDate;
-  if (ageSeconds < -60 || ageSeconds > 86400) return null;
+  if (ageSeconds < -60) return rejectTelegram('auth_date_in_future', hasSignature);
+  if (ageSeconds > 86400) return rejectTelegram('auth_date_expired', hasSignature);
   const unique = new Set();
-  for (const [key] of params) { if (unique.has(key)) return null; unique.add(key); }
-  const dataCheckString = [...params.entries()].filter(([key]) => key !== 'hash' && key !== 'signature')
-    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, value]) => `${key}=${value}`).join('\n');
+  for (const [key] of params) {
+    if (unique.has(key)) return rejectTelegram('duplicate_parameter', hasSignature);
+    unique.add(key);
+  }
+  // Bot-token HMAC validation: exclude only `hash`. The `signature` field,
+  // if supplied, is part of the signed payload. For Ed25519 third-party
+  // verification (not used here), both hash and signature are excluded.
+  const dataCheckString = [...params.entries()].filter(([key]) => key !== 'hash')
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+    .map(([key, value]) => `${key}=${value}`).join('\n');
   const secret = crypto.createHmac('sha256', 'WebAppData').update(token).digest();
   const calculated = crypto.createHmac('sha256', secret).update(dataCheckString).digest();
-  if (!crypto.timingSafeEqual(Buffer.from(hash, 'hex'), calculated)) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(hash, 'hex'), calculated)) {
+    return rejectTelegram('hash_mismatch', hasSignature);
+  }
   try {
     const user = JSON.parse(params.get('user') || 'null');
-    if (!user || !Number.isSafeInteger(user.id) || user.id <= 0) return null;
+    if (!user || !Number.isSafeInteger(user.id) || user.id <= 0)
+      return rejectTelegram('signed_user_invalid_or_missing', hasSignature);
     return user;
-  } catch { return null; }
+  } catch { return rejectTelegram('signed_user_json_invalid', hasSignature); }
 }
 
 async function authenticatedUser(req) {
@@ -99,7 +122,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(204, {...cors, 'access-control-allow-methods':'GET, PUT, OPTIONS', 'access-control-allow-headers':'X-Telegram-Init-Data, Content-Type', 'access-control-max-age':'600'});
       res.end(); return;
     }
-    if (req.method === 'GET' && pathname === '/') return json(res, 200, {service:'skillup-api', version:'0.2.0', status:ready ? 'ready' : 'starting'}, cors);
+    if (req.method === 'GET' && pathname === '/') return json(res, 200, {service:'skillup-api', version:'0.2.1-authfix', status:ready ? 'ready' : 'starting'}, cors);
     if (req.method === 'GET' && pathname === '/health') {
       if (!ready) return json(res, 503, {status:'unavailable'}, cors);
       try { await pool.query('SELECT 1'); return json(res, 200, {status:'ok', database:'connected'}, cors); }
