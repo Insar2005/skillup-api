@@ -4,6 +4,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { Pool } from 'pg';
+import { handleAiRoute } from './ai-routes.js';
 
 const port = Number(process.env.PORT || 3000);
 const pool = process.env.DATABASE_URL ? new Pool({
@@ -119,20 +120,21 @@ const server = http.createServer(async (req, res) => {
     const pathname = new URL(req.url, 'http://localhost').pathname;
     if (req.method === 'OPTIONS') {
       if (!Object.keys(cors).length) return json(res, 403, {error:'Origin not allowed'});
-      res.writeHead(204, {...cors, 'access-control-allow-methods':'GET, PUT, OPTIONS', 'access-control-allow-headers':'X-Telegram-Init-Data, Content-Type', 'access-control-max-age':'600'});
+      res.writeHead(204, {...cors, 'access-control-allow-methods':'GET, POST, PUT, OPTIONS', 'access-control-allow-headers':'X-Telegram-Init-Data, X-SkillUp-Timezone, Content-Type', 'access-control-max-age':'600'});
       res.end(); return;
     }
-    if (req.method === 'GET' && pathname === '/') return json(res, 200, {service:'skillup-api', version:'0.2.1-authfix', status:ready ? 'ready' : 'starting'}, cors);
+    if (req.method === 'GET' && pathname === '/') return json(res, 200, {service:'skillup-api', version:'0.3.0-single-ai', status:ready ? 'ready' : 'starting'}, cors);
     if (req.method === 'GET' && pathname === '/health') {
       if (!ready) return json(res, 503, {status:'unavailable'}, cors);
       try { await pool.query('SELECT 1'); return json(res, 200, {status:'ok', database:'connected'}, cors); }
       catch { return json(res, 503, {status:'unavailable', database:'disconnected'}, cors); }
     }
-    if (pathname === '/api/v1/me' || pathname.startsWith('/api/v1/documents/')) {
+    if (pathname === '/api/v1/me' || pathname.startsWith('/api/v1/documents/') || pathname.startsWith('/api/v1/ai/')) {
       if (!ready || !process.env.TELEGRAM_BOT_TOKEN) return json(res, 503, {error:'Service not configured'}, cors);
       const user = await authenticatedUser(req);
       if (!user) return json(res, 401, {error:'Valid Telegram Mini App authorization required'}, cors);
       if (pathname === '/api/v1/me' && req.method === 'GET') return json(res, 200, {user}, cors);
+      if (pathname.startsWith('/api/v1/ai/')) return handleAiRoute({req,res,pathname,pool,user,cors,readJsonBody});
       const match = /^\/api\/v1\/documents\/([a-z]+)$/.exec(pathname);
       if (!match || !DOC_KINDS.has(match[1])) return json(res, 404, {error:'Not found'}, cors);
       const kind=match[1];
