@@ -3,6 +3,8 @@ import {inspectReceiptMedia,saveReceiptDraft,commitReceiptDraft,undoReceiptDraft
 import crypto from 'node:crypto';
 import {generateAgentAnswer,validateInputMessage} from './ai.js';
 import {classifyFinance,EXPENSE_CATEGORIES,INCOME_CATEGORIES} from './bot-finance.js';
+import {enrichFinanceCategory} from './category.js';
+import {handleDevelopmentText,confirmDeleteGoals,cancelPendingDelete,restoreGoals} from './development-actions.js';
 
 const API='https://api.telegram.org/bot';
 const headers={ 'content-type':'application/json' };
@@ -92,6 +94,16 @@ async function commitFinance(pool,user,draftId){
 }
 async function callback(pool,update){
   const cb=update.callback_query;if(!cb?.from?.id||cb.message?.chat?.type!=='private'||cb.message.chat.id!==cb.from.id)return;
+  const devMatch=/^dg:(ok|no|restore):([0-9a-f-]{36})$/.exec(cb.data||'');
+  if(devMatch){
+    const user=await ensureUser(pool,cb.from);
+    const action=devMatch[1]==='ok'?await confirmDeleteGoals(pool,user,devMatch[2]):
+      devMatch[1]==='no'?await cancelPendingDelete(pool,user,devMatch[2]):await restoreGoals(pool,user,devMatch[2]);
+    await telegram('answerCallbackQuery',{callback_query_id:cb.id,text:action.text.slice(0,180)});
+    await recordBotChat(pool,user,update.update_id,'Действие с целями',action.text);
+    await say(cb.message.chat.id,action.text,action.archiveId?{reply_markup:{inline_keyboard:[[{text:'↷ Восстановить цели',callback_data:`dg:restore:${action.archiveId}`}]]}}:{});
+    return;
+  }
   const undoMatch=/^u:(\d{1,20})$/.exec(cb.data||'');
   if(undoMatch){
     const user=await ensureUser(pool,cb.from);
@@ -218,6 +230,13 @@ async function message(pool,update){
     await say(chat,`🎙 Распознал: ${text}`);
   }
   if(!text)return;
+  const dev=await handleDevelopmentText(pool,user,text);
+  if(dev){
+    await recordBotChat(pool,user,update.update_id,text,dev.text);
+    const menu=dev.pending?{inline_keyboard:[[{text:`Удалить ${dev.pending.count} целей`,callback_data:`dg:ok:${dev.pending.id}`},{text:'Оставить',callback_data:`dg:no:${dev.pending.id}`}]]}:
+      dev.archiveId?{inline_keyboard:[[{text:'↷ Восстановить',callback_data:`dg:restore:${dev.archiveId}`}]]}:null;
+    await say(chat,dev.text,menu?{reply_markup:menu}:{});return;
+  }
   if(financeCorrectionIntent(text)==='restore'){
     const restored=await restoreLastFinance(pool,user);
     const answer=restored?restoredFinanceReply(restored.entry):'За последние 24 часа нет отменённой операции, которую можно восстановить. Если расход отменён до обновления бота, запиши его повторно.';
@@ -228,8 +247,9 @@ async function message(pool,update){
   }
   const parsed=parseFinanceIntent(text,user.preferred_currency||'RUB');
   if(parsed){
-    const saved=await appendFinance(pool,user,[parsed],`bot:${update.update_id}`,'telegram_bot');
-    const answer=saved.added?financeReply(parsed,saved.entries):'Эта операция уже была обработана. Повторно не записывал.';
+    const categorized=await enrichFinanceCategory(parsed,text);
+    const saved=await appendFinance(pool,user,[categorized],`bot:${update.update_id}`,'telegram_bot');
+    const answer=saved.added?financeReply(categorized,saved.entries):'Эта операция уже была обработана. Повторно не записывал.';
     await recordBotChat(pool,user,update.update_id,text,answer);
     await say(chat,answer,saved.added?{reply_markup:{inline_keyboard:[[{text:'↶ Отменить',callback_data:`u:${update.update_id}`}]]}}:{});return;
   }

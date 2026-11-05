@@ -1,6 +1,7 @@
 // A narrow, non-LLM path for clear income/expense statements.
 // Any ambiguous sentence goes to Claude instead of silently creating a transaction.
 import {extractAmount} from './bot-finance.js';
+import {localExpenseCategory} from './category.js';
 const currencies={RUB:/\bRUB\b|рубл|руб\b|₽/iu,KGS:/\bKGS\b|сом(?:ов|а)?(?=\s|$|[,.!?])|сому|сомы/iu,USD:/\bUSD\b|доллар|\$/iu,EUR:/\bEUR\b|евро|€/iu,KZT:/\bKZT\b|тенге|₸/iu,UZS:/\bUZS\b|сум(?:ов|а)?\b/iu,CNY:/\bCNY\b|юан|¥/iu};
 const categories=[
  ['Гаджеты',/айпад|ipad|iphone|айфон|ноутбук|телефон|планшет|гаджет|компьютер|смартфон/iu],
@@ -15,7 +16,7 @@ export function parseFinanceIntent(text, defaultCurrency='RUB'){
  const t=String(text||'').trim();if(!t||t.length>1500)return null;
  if(/[?？]/.test(t)||/^(сколько|как|почему|что мне|отч[её]т|покажи|подсчитай|проанализируй|можно ли|хочу)/iu.test(t))return null;
  const income=/(?:получил|заработал|зарплат|аванс|поступил|пришли деньги|преми|продал|выручк|доход)/iu.test(t);
- const expense=/(?:купил|купила|потратил|потратила|оплатил|оплатила|заплатил|заплатила|взял|заказал|расход|списал)/iu.test(t);
+ const expense=/(?:купил|купила|потратил|потратила|оплатил|оплатила|заплатил|заплатила|взял|заказал|расход|списал|обедал|ужинал|завтракал|(?:выпил|поел)[^.!?\n]{0,40}(?:в кафе|в ресторане|в столовой))/iu.test(t);
  const shorthand=/^(?:\s*\d[\d\s.,]*(?:\s*(?:сом|сомов|₽|руб|доллар|usd|kgs|евро|eur))?\s+на\s+.{2,})$/iu.test(t);
  if(income&&expense)return null;
  if(!income&&!expense&&!shorthand)return null;
@@ -23,7 +24,7 @@ export function parseFinanceIntent(text, defaultCurrency='RUB'){
  const explicit=Object.keys(currencies).filter(k=>currencies[k].test(t));if(explicit.length>1)return null;
  const currency=explicit[0]||defaultCurrency;
  const direction=income?'Доход':'Расход';
- const category=income?(/зарплат|оклад|аванс/iu.test(t)?'Зарплата':'Прочие доходы'):(categories.find(([,re])=>re.test(t))?.[0]||'Прочее');
+ const category=income?(/зарплат|оклад|аванс/iu.test(t)?'Зарплата':'Прочие доходы'):(localExpenseCategory(t)||categories.find(([,re])=>re.test(t))?.[0]||'Прочее');
  return {type:direction,amount,currency,category,note:t.slice(0,250)};
 }
 // Treat short corrective commands as DB actions, never as ordinary Claude chat.
