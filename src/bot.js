@@ -1,3 +1,4 @@
+import {executeAgentAction} from './agent-actions.js';
 import {parseFinanceIntent,appendFinance,financeReply,undoFinanceExternal,restoreFinanceExternal,restoreLastFinance,financeCorrectionIntent,restoredFinanceReply} from './ai-finance.js';
 import {inspectReceiptMedia,saveReceiptDraft,commitReceiptDraft,undoReceiptDraft} from './ai-media.js';
 import crypto from 'node:crypto';
@@ -230,6 +231,12 @@ async function message(pool,update){
     await say(chat,`🎙 Распознал: ${text}`);
   }
   if(!text)return;
+  const directAction=await executeAgentAction(pool,user,text,{key:`bot:${update.update_id}`,timezone:'Asia/Bishkek'});
+  if(directAction){
+    await recordBotChat(pool,user,update.update_id,text,directAction.text);
+    await say(chat,directAction.text);
+    return;
+  }
   const dev=await handleDevelopmentText(pool,user,text);
   if(dev){
     await recordBotChat(pool,user,update.update_id,text,dev.text);

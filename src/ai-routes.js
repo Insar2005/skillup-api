@@ -1,3 +1,4 @@
+import {executeAgentAction} from './agent-actions.js';
 import {parseFinanceIntent,appendFinance,financeReply,restoreLastFinance,financeCorrectionIntent,restoredFinanceReply} from './ai-finance.js';
 import {handleAiMediaRoute} from './ai-media.js';
 import {handleDevelopmentText} from './development-actions.js';
@@ -26,6 +27,17 @@ export async function handleAiRoute({req,res,pathname,pool,user,cors,readJsonBod
       // Fast deterministic path. A clear finance statement is saved immediately;
       // Claude is used only for ambiguous wording or general discussion.
       // Mutating commands never go to Claude. They use user-scoped DB transactions.
+      const directAction=await executeAgentAction(pool,user,body.message,{key:`chat:${body.requestId}`,timezone:req.headers?.['x-skillup-timezone']||'Asia/Bishkek'});
+      if(directAction){
+        const answer=directAction.text;
+        const c=await pool.connect();
+        try {await c.query('BEGIN');
+          const u=await c.query('INSERT INTO ai_messages(user_id,role,content,request_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id',[id,'user',body.message.trim(),body.requestId]);
+          if(u.rowCount)await c.query('INSERT INTO ai_messages(user_id,role,content,reply_to) VALUES($1,$2,$3,$4)',[id,'assistant',answer,body.requestId]);
+          await c.query('COMMIT');
+        }catch(e){await c.query('ROLLBACK').catch(()=>{});throw e;}finally{c.release();}
+        return json(res,200,{answer,agentAction:true,developmentChanged:directAction.changed,financeChanged:directAction.changed},cors);
+      }
       const dev=await handleDevelopmentText(pool,user,body.message);
       if(dev){
         const answer=dev.text;
