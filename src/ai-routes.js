@@ -1,4 +1,4 @@
-import {parseFinanceIntent,appendFinance,financeReply} from './ai-finance.js';
+import {parseFinanceIntent,appendFinance,financeReply,restoreLastFinance,financeCorrectionIntent,restoredFinanceReply} from './ai-finance.js';
 import {handleAiMediaRoute} from './ai-media.js';
 import {generateAgentAnswer,normalizeTimezone,validateInputMessage,legacyKey} from './ai.js';
 
@@ -12,7 +12,6 @@ export async function handleAiRoute({req,res,pathname,pool,user,cors,readJsonBod
     return json(res,200,{messages:rows.rows},cors);
   }
   if(req.method==='POST'&&pathname==='/api/v1/ai/chat'){
-    if(!process.env.ANTHROPIC_API_KEY)return json(res,503,{error:'ai_unconfigured',message:'Добавь ANTHROPIC_API_KEY в Railway → skillup-api → Variables.'},cors);
     const body=await readJsonBody(req);
     if(!validateInputMessage(body?.message)||typeof body.requestId!=='string'||! /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(body.requestId))return json(res,400,{error:'invalid_message'},cors);
     const id=String(user.id);
@@ -25,10 +24,21 @@ export async function handleAiRoute({req,res,pathname,pool,user,cors,readJsonBod
       // Fast deterministic path. A clear finance statement is saved immediately;
       // Claude is used only for ambiguous wording or general discussion.
       const pref=await pool.query('SELECT preferred_currency FROM users WHERE id=$1',[id]);
+      if(financeCorrectionIntent(body.message)==='restore'){
+        const restored=await restoreLastFinance(pool,user);
+        const answer=restored?restoredFinanceReply(restored.entry):'За последние 24 часа отменённых операций для восстановления не найдено.';
+        const c=await pool.connect();
+        try {await c.query('BEGIN');
+          const u=await c.query('INSERT INTO ai_messages(user_id,role,content,request_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id',[id,'user',body.message.trim(),body.requestId]);
+          if(u.rowCount)await c.query('INSERT INTO ai_messages(user_id,role,content,reply_to) VALUES($1,$2,$3,$4)',[id,'assistant',answer,body.requestId]);
+          await c.query('COMMIT');
+        }catch(e){await c.query('ROLLBACK').catch(()=>{});throw e;}finally{c.release();}
+        return json(res,200,{answer,financeRestored:!!restored},cors);
+      }
       const transaction=parseFinanceIntent(body.message,pref.rows[0]?.preferred_currency||'RUB');
       if(transaction){
         const saved=await appendFinance(pool,user,[transaction],`chat:${body.requestId}`,'chat');
-        const answer=financeReply(transaction,saved.entries);
+        const answer=saved.added?financeReply(transaction,saved.entries):'Эта операция уже была обработана. Повторно не записывал.';
         const c=await pool.connect();
         try {await c.query('BEGIN');
           const u=await c.query('INSERT INTO ai_messages(user_id,role,content,request_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id',[id,'user',body.message.trim(),body.requestId]);
@@ -38,6 +48,7 @@ export async function handleAiRoute({req,res,pathname,pool,user,cors,readJsonBod
         return json(res,200,{answer,financeSaved:true},cors);
       }
 
+    if(!process.env.ANTHROPIC_API_KEY)return json(res,503,{error:'ai_unconfigured',message:'ИИ временно недоступен; операции и их восстановление продолжают работать.'},cors);
     const count=await pool.query("SELECT count(*)::int AS n, count(*) FILTER (WHERE created_at>now()-interval '1 day')::int AS today FROM ai_messages WHERE user_id=$1 AND role='user' AND legacy_key IS NULL AND created_at>now()-interval '1 day'",[id]);
     const fifteen=await pool.query("SELECT count(*)::int AS n FROM ai_messages WHERE user_id=$1 AND role='user' AND legacy_key IS NULL AND created_at>now()-interval '15 minutes'",[id]);
     if(count.rows[0].today>=50||fifteen.rows[0].n>=12)return json(res,429,{error:'limit_reached',message:'Лимит запросов: 12 за 15 минут и 50 в сутки.'},cors);

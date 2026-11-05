@@ -1,4 +1,4 @@
-import {parseFinanceIntent,appendFinance,financeReply,undoFinanceExternal} from './ai-finance.js';
+import {parseFinanceIntent,appendFinance,financeReply,undoFinanceExternal,restoreFinanceExternal,restoreLastFinance,financeCorrectionIntent,restoredFinanceReply} from './ai-finance.js';
 import {inspectReceiptMedia,saveReceiptDraft,commitReceiptDraft,undoReceiptDraft} from './ai-media.js';
 import crypto from 'node:crypto';
 import {generateAgentAnswer,validateInputMessage} from './ai.js';
@@ -96,9 +96,24 @@ async function callback(pool,update){
   if(undoMatch){
     const user=await ensureUser(pool,cb.from);
     const ok=await undoFinanceExternal(pool,user,`bot:${undoMatch[1]}:0`);
-    const msg=ok?'Последняя операция отменена.':'Эта операция уже отменена или не найдена.';
-    await telegram('answerCallbackQuery',{callback_query_id:cb.id,text:msg});
-    if(ok)await say(cb.message.chat.id,msg);
+    const msg=ok?'Отменил операцию. Чтобы восстановить, нажми «Вернуть» или напиши «Верни».':'Эта операция уже отменена или не найдена.';
+    await telegram('answerCallbackQuery',{callback_query_id:cb.id,text:msg.slice(0,190)});
+    if(ok){
+      await recordBotChat(pool,user,update.update_id,'Отменить операцию',msg);
+      await say(cb.message.chat.id,msg,{reply_markup:{inline_keyboard:[[{text:'↷ Вернуть',callback_data:`re:${undoMatch[1]}`}]]}});
+    }
+    return;
+  }
+  const redoMatch=/^re:(\d{1,20})$/.exec(cb.data||'');
+  if(redoMatch){
+    const user=await ensureUser(pool,cb.from);
+    const restored=await restoreFinanceExternal(pool,user,`bot:${redoMatch[1]}:0`);
+    const msg=restored?restoredFinanceReply(restored.entry):'Операция уже восстановлена или не найдена.';
+    await telegram('answerCallbackQuery',{callback_query_id:cb.id,text:msg.slice(0,190)});
+    if(restored){
+      await recordBotChat(pool,user,update.update_id,'Вернуть операцию',msg);
+      await say(cb.message.chat.id,msg,{reply_markup:{inline_keyboard:[[{text:'↶ Отменить',callback_data:`u:${redoMatch[1]}`}]]}});
+    }
     return;
   }
   const receiptMatch=/^r:(ok|undo):([0-9a-f-]{36})$/.exec(cb.data||'');
@@ -203,10 +218,20 @@ async function message(pool,update){
     await say(chat,`🎙 Распознал: ${text}`);
   }
   if(!text)return;
+  if(financeCorrectionIntent(text)==='restore'){
+    const restored=await restoreLastFinance(pool,user);
+    const answer=restored?restoredFinanceReply(restored.entry):'За последние 24 часа нет отменённой операции, которую можно восстановить. Если расход отменён до обновления бота, запиши его повторно.';
+    await recordBotChat(pool,user,update.update_id,text,answer);
+    const match=restored&&/^bot:(\d+):0$/.exec(restored.externalId);
+    await say(chat,answer,match?{reply_markup:{inline_keyboard:[[{text:'↶ Отменить',callback_data:`u:${match[1]}`}]]}}:{});
+    return;
+  }
   const parsed=parseFinanceIntent(text,user.preferred_currency||'RUB');
   if(parsed){
     const saved=await appendFinance(pool,user,[parsed],`bot:${update.update_id}`,'telegram_bot');
-    const answer=financeReply(parsed,saved.entries);await recordBotChat(pool,user,update.update_id,text,answer);await say(chat,answer,{reply_markup:{inline_keyboard:[[{text:'↶ Отменить',callback_data:`u:${update.update_id}`}]]}});return;
+    const answer=saved.added?financeReply(parsed,saved.entries):'Эта операция уже была обработана. Повторно не записывал.';
+    await recordBotChat(pool,user,update.update_id,text,answer);
+    await say(chat,answer,saved.added?{reply_markup:{inline_keyboard:[[{text:'↶ Отменить',callback_data:`u:${update.update_id}`}]]}}:{});return;
   }
   await chatWithClaude(pool,user,chat,text);
 }
