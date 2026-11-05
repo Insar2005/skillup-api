@@ -121,24 +121,36 @@ const server = http.createServer(async (req, res) => {
     const pathname = new URL(req.url, 'http://localhost').pathname;
     if (req.method === 'OPTIONS') {
       if (!Object.keys(cors).length) return json(res, 403, {error:'Origin not allowed'});
-      res.writeHead(204, {...cors, 'access-control-allow-methods':'GET, POST, PUT, OPTIONS', 'access-control-allow-headers':'X-Telegram-Init-Data, X-SkillUp-Timezone, Content-Type', 'access-control-max-age':'600'});
+      res.writeHead(204, {...cors, 'access-control-allow-methods':'GET, POST, PUT, OPTIONS', 'access-control-allow-headers':'X-Telegram-Init-Data, X-SkillUp-Timezone, X-SkillUp-Photo-Prompt, Content-Type', 'access-control-max-age':'600'});
       res.end(); return;
     }
     if (req.method === 'POST' && pathname === '/api/v1/telegram/webhook') {
       if (!ready) return json(res,503,{error:'Not ready'});
       return acceptTelegramWebhook(req,res,pool);
     }
-    if (req.method === 'GET' && pathname === '/') return json(res, 200, {service:'skillup-api', version:'0.3.1-telegram-bot', status:ready ? 'ready' : 'starting'}, cors);
+    if (req.method === 'GET' && pathname === '/') return json(res, 200, {service:'skillup-api', version:'0.3.2-chat-media', status:ready ? 'ready' : 'starting'}, cors);
     if (req.method === 'GET' && pathname === '/health') {
       if (!ready) return json(res, 503, {status:'unavailable'}, cors);
       try { await pool.query('SELECT 1'); return json(res, 200, {status:'ok', database:'connected'}, cors); }
       catch { return json(res, 503, {status:'unavailable', database:'disconnected'}, cors); }
     }
-    if (pathname === '/api/v1/me' || pathname.startsWith('/api/v1/documents/') || pathname.startsWith('/api/v1/ai/')) {
+    if (pathname === '/api/v1/me' || pathname === '/api/v1/preferences' || pathname.startsWith('/api/v1/documents/') || pathname.startsWith('/api/v1/ai/')) {
       if (!ready || !process.env.TELEGRAM_BOT_TOKEN) return json(res, 503, {error:'Service not configured'}, cors);
       const user = await authenticatedUser(req);
       if (!user) return json(res, 401, {error:'Valid Telegram Mini App authorization required'}, cors);
       if (pathname === '/api/v1/me' && req.method === 'GET') return json(res, 200, {user}, cors);
+      if (pathname === '/api/v1/preferences' && req.method === 'GET') {
+        const r=await pool.query('SELECT preferred_currency FROM users WHERE id=$1',[user.id]);
+        return json(res,200,{preferredCurrency:r.rows[0]?.preferred_currency||'RUB'},cors);
+      }
+      if (pathname === '/api/v1/preferences' && req.method === 'PUT') {
+        const body=await readJsonBody(req);
+        if(!['RUB','KGS','USD','EUR','KZT','UZS','CNY','TRY','AED','GBP'].includes(body?.preferredCurrency))
+          return json(res,400,{message:'Недопустимая валюта'},cors);
+        await pool.query('UPDATE users SET preferred_currency=$2 WHERE id=$1',[user.id,body.preferredCurrency]);
+        return json(res,200,{preferredCurrency:body.preferredCurrency},cors);
+      }
+
       if (pathname.startsWith('/api/v1/ai/')) return handleAiRoute({req,res,pathname,pool,user,cors,readJsonBody});
       const match = /^\/api\/v1\/documents\/([a-z]+)$/.exec(pathname);
       if (!match || !DOC_KINDS.has(match[1])) return json(res, 404, {error:'Not found'}, cors);

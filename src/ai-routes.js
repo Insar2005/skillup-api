@@ -1,9 +1,12 @@
+import {parseFinanceIntent,appendFinance,financeReply} from './ai-finance.js';
+import {handleAiMediaRoute} from './ai-media.js';
 import {generateAgentAnswer,normalizeTimezone,validateInputMessage,legacyKey} from './ai.js';
 
 const busyUsers=new Set();
 function json(res,status,data,cors={}){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store',...cors});res.end(JSON.stringify(data));}
 function safeError(error){if(error?.code==='model_rate_limited')return {status:429,code:'provider_rate_limited',message:'ИИ сейчас перегружен. Попробуй позже.'};return {status:502,code:'model_unavailable',message:'Не удалось получить ответ ИИ. Сообщение не записано.'};}
 export async function handleAiRoute({req,res,pathname,pool,user,cors,readJsonBody}){
+  if(['/api/v1/ai/media','/api/v1/ai/transcribe','/api/v1/ai/receipts/pending','/api/v1/ai/receipts/recent','/api/v1/ai/receipts/apply','/api/v1/ai/receipts/undo'].includes(pathname)) return handleAiMediaRoute({req,res,pathname,pool,user,cors,readJsonBody});
   if(req.method==='GET'&&pathname==='/api/v1/ai/history'){
     const rows=await pool.query('SELECT id, role, content AS text, created_at FROM (SELECT id,role,content,created_at FROM ai_messages WHERE user_id=$1 ORDER BY created_at DESC,id DESC LIMIT 100) recent ORDER BY created_at ASC,id ASC',[user.id]);
     return json(res,200,{messages:rows.rows},cors);
@@ -16,8 +19,25 @@ export async function handleAiRoute({req,res,pathname,pool,user,cors,readJsonBod
     const existing=await pool.query('SELECT id FROM ai_messages WHERE user_id=$1 AND request_id=$2',[id,body.requestId]);
     if(existing.rowCount){const answer=await pool.query('SELECT content AS answer FROM ai_messages WHERE user_id=$1 AND reply_to=$2 LIMIT 1',[id,body.requestId]);if(!answer.rowCount)return json(res,409,{error:'ai_busy',message:'Ответ ещё сохраняется. Повтори запрос чуть позже.'},cors);return json(res,200,{answer:answer.rows[0].answer,duplicate:true},cors);}
     if(busyUsers.has(id))return json(res,409,{error:'ai_busy',message:'Предыдущий ответ ещё формируется.'},cors);
+
     busyUsers.add(id);
     try {
+      // Fast deterministic path. A clear finance statement is saved immediately;
+      // Claude is used only for ambiguous wording or general discussion.
+      const pref=await pool.query('SELECT preferred_currency FROM users WHERE id=$1',[id]);
+      const transaction=parseFinanceIntent(body.message,pref.rows[0]?.preferred_currency||'RUB');
+      if(transaction){
+        const saved=await appendFinance(pool,user,[transaction],`chat:${body.requestId}`,'chat');
+        const answer=financeReply(transaction,saved.entries);
+        const c=await pool.connect();
+        try {await c.query('BEGIN');
+          const u=await c.query('INSERT INTO ai_messages(user_id,role,content,request_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id',[id,'user',body.message.trim(),body.requestId]);
+          if(u.rowCount)await c.query('INSERT INTO ai_messages(user_id,role,content,reply_to) VALUES($1,$2,$3,$4)',[id,'assistant',answer,body.requestId]);
+          await c.query('COMMIT');
+        }catch(e){await c.query('ROLLBACK').catch(()=>{});throw e;}finally{c.release();}
+        return json(res,200,{answer,financeSaved:true},cors);
+      }
+
     const count=await pool.query("SELECT count(*)::int AS n, count(*) FILTER (WHERE created_at>now()-interval '1 day')::int AS today FROM ai_messages WHERE user_id=$1 AND role='user' AND legacy_key IS NULL AND created_at>now()-interval '1 day'",[id]);
     const fifteen=await pool.query("SELECT count(*)::int AS n FROM ai_messages WHERE user_id=$1 AND role='user' AND legacy_key IS NULL AND created_at>now()-interval '15 minutes'",[id]);
     if(count.rows[0].today>=50||fifteen.rows[0].n>=12)return json(res,429,{error:'limit_reached',message:'Лимит запросов: 12 за 15 минут и 50 в сутки.'},cors);

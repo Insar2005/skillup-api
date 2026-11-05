@@ -1,6 +1,6 @@
 {
   "name": "skillup-api",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,7 +8,8 @@
     "check": "node --check src/server.js",
     "test:auth": "node tests/auth.test.mjs",
     "test:ai": "node --test tests/ai.test.mjs",
-    "test:bot": "node --test tests/bot.test.mjs"
+    "test:bot": "node --test tests/bot.test.mjs",
+    "test:media": "node --test tests/chat-media.test.mjs"
   },
   "dependencies": {
     "pg": "^8.13.3"

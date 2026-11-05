@@ -1,3 +1,5 @@
+import {parseFinanceIntent,appendFinance,financeReply,undoFinanceExternal} from './ai-finance.js';
+import {inspectReceiptMedia,saveReceiptDraft,commitReceiptDraft,undoReceiptDraft} from './ai-media.js';
 import crypto from 'node:crypto';
 import {generateAgentAnswer,validateInputMessage} from './ai.js';
 import {classifyFinance,EXPENSE_CATEGORIES,INCOME_CATEGORIES} from './bot-finance.js';
@@ -16,14 +18,24 @@ export async function telegram(method,data){
   return body.result;
 }
 async function say(chat_id,text,extra={}){
-  const value=String(text||'').slice(0,3800);
-  return telegram('sendMessage',{chat_id,text:value,...extra});
+  // Do not truncate replies in the middle of a sentence. Normal replies are short;
+  // explicit long reports are split at paragraph / sentence / whitespace boundaries.
+  let rest=String(text||'').trim();let last;
+  while(rest){
+    if(rest.length<=3500){last=await telegram('sendMessage',{chat_id,text:rest,...extra});break;}
+    const fragment=rest.slice(0,3500);
+    let cut=Math.max(fragment.lastIndexOf('\n'),fragment.lastIndexOf('. '),fragment.lastIndexOf(' '));
+    if(cut<2000)cut=3500;
+    last=await telegram('sendMessage',{chat_id,text:fragment.slice(0,cut).trim()});
+    rest=rest.slice(cut).trim();
+  }
+  return last;
 }
 async function ensureUser(pool,tg){
   const r=await pool.query(`INSERT INTO users (telegram_id,first_name,last_name,username,language_code)
     VALUES($1,$2,$3,$4,$5) ON CONFLICT(telegram_id) DO UPDATE SET
     first_name=EXCLUDED.first_name,last_name=EXCLUDED.last_name,username=EXCLUDED.username,updated_at=now()
-    RETURNING id,telegram_id`,[tg.id,tg.first_name||null,tg.last_name||null,tg.username||null,tg.language_code||null]);
+    RETURNING id,telegram_id,preferred_currency`,[tg.id,tg.first_name||null,tg.last_name||null,tg.username||null,tg.language_code||null]);
   return r.rows[0];
 }
 async function fileToText(fileId){
@@ -80,6 +92,24 @@ async function commitFinance(pool,user,draftId){
 }
 async function callback(pool,update){
   const cb=update.callback_query;if(!cb?.from?.id||cb.message?.chat?.type!=='private'||cb.message.chat.id!==cb.from.id)return;
+  const undoMatch=/^u:(\d{1,20})$/.exec(cb.data||'');
+  if(undoMatch){
+    const user=await ensureUser(pool,cb.from);
+    const ok=await undoFinanceExternal(pool,user,`bot:${undoMatch[1]}:0`);
+    const msg=ok?'Последняя операция отменена.':'Эта операция уже отменена или не найдена.';
+    await telegram('answerCallbackQuery',{callback_query_id:cb.id,text:msg});
+    if(ok)await say(cb.message.chat.id,msg);
+    return;
+  }
+  const receiptMatch=/^r:(ok|undo):([0-9a-f-]{36})$/.exec(cb.data||'');
+  if(receiptMatch){
+    const user=await ensureUser(pool,cb.from);
+    const result=receiptMatch[1]==='ok'?await commitReceiptDraft(pool,user,receiptMatch[2],user.preferred_currency||'RUB'):{saved:await undoReceiptDraft(pool,user,receiptMatch[2])};
+    const msg=receiptMatch[1]==='ok'?(result.saved?'Чек добавлен в Финансы.':result.message||'Не удалось записать чек.'):(result.saved?'Записи этого чека удалены.':'Чек уже отменён или не найден.');
+    await telegram('answerCallbackQuery',{callback_query_id:cb.id,text:msg.slice(0,190)});
+    await say(cb.message.chat.id,msg,receiptMatch[1]==='ok'&&result.saved?{reply_markup:{inline_keyboard:[[{text:'↶ Отменить чек',callback_data:`r:undo:${receiptMatch[2]}`}]]}}:{});
+    return;
+  }
   const m=/^f:(ok|no|cat):([0-9a-f-]{36}):(\d)$/.exec(cb.data||'');
   if(!m)return;
   const user=await ensureUser(pool,cb.from);
@@ -119,10 +149,50 @@ async function chatWithClaude(pool,user,chat,text){
   }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
   await say(chat,answer);
 }
+async function recordBotChat(pool,user,updateId,text,answer){
+ const hex=crypto.createHash('sha256').update('bot:'+updateId).digest('hex');
+ const id=`${hex.slice(0,8)}-${hex.slice(8,12)}-4${hex.slice(13,16)}-a${hex.slice(17,20)}-${hex.slice(20,32)}`;
+ const r=await pool.query('INSERT INTO ai_messages(user_id,role,content,request_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id',[user.id,'user',String(text).slice(0,1500),id]);
+ if(r.rowCount)await pool.query('INSERT INTO ai_messages(user_id,role,content,reply_to) VALUES($1,$2,$3,$4)',[user.id,'assistant',String(answer).slice(0,2200),id]);
+}
+async function handleMediaMessage(pool,user,chat,m,updateId){
+ const photo=m.photo?.at(-1);
+ const document=m.document;
+ if(!photo&&!document)return false;
+ if((photo?.file_size||document?.file_size||0)>6*1024*1024){await say(chat,'Файл слишком большой — максимум 6 МБ.');return true;}
+ const fileId=photo?.file_id||document?.file_id;
+ if(!fileId)return true;
+ const info=await telegram('getFile',{file_id:fileId});
+ if(typeof info?.file_path!=='string'||!info.file_path||info.file_path.length>512){await say(chat,'Не удалось получить вложение.');return true;}
+ const r=await fetch(`https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${info.file_path}`,{signal:AbortSignal.timeout(15000)});
+ if(!r.ok){await say(chat,'Не удалось скачать вложение из Telegram.');return true;}
+ const buffer=Buffer.from(await r.arrayBuffer());
+ if(buffer.length>6*1024*1024){await say(chat,'Отправь более компактный файл до 6 МБ.');return true;}
+ let type='';
+ if(buffer.subarray(0,3).toString('hex')==='ffd8ff')type='image/jpeg';
+ else if(buffer.subarray(0,8).toString('hex')==='89504e470d0a1a0a')type='image/png';
+ else if(buffer.subarray(0,4).toString()==='RIFF'&&buffer.subarray(8,12).toString()==='WEBP')type='image/webp';
+ else if(buffer.subarray(0,5).toString()==='%PDF-')type='application/pdf';
+ if(!type){await say(chat,'Можно отправить фото чека (JPG, PNG, WebP) или PDF.');return true;}
+ if(!process.env.ANTHROPIC_API_KEY){await say(chat,'Распознавание фото не настроено.');return true;}
+ const {output,receipt}=await inspectReceiptMedia(buffer,type,String(m.caption||''));
+ if(!receipt){const answer=String(output?.answer||'На фото не удалось разобрать чек.').slice(0,1600);await recordBotChat(pool,user,updateId,'📎 Фото или документ',answer);await say(chat,answer);return true;}
+ const id=await saveReceiptDraft(pool,user.id,receipt);
+ // One high-confidence, currency-explicit receipt may be saved immediately.
+ // Unreconciled items / unknown currency require one action for the whole receipt.
+ if(receipt.reconciled&&receipt.currency){
+   const result=await commitReceiptDraft(pool,user,id,receipt.currency);
+   if(result.saved){const answer=`🧾 Записал ${result.count} операций по чеку: ${receipt.total} ${receipt.currency}.`;await recordBotChat(pool,user,updateId,'📎 Чек',answer);await say(chat,answer,{reply_markup:{inline_keyboard:[[{text:'↶ Отменить чек',callback_data:`r:undo:${id}`}]]}});return true;}
+ }
+ await recordBotChat(pool,user,updateId,'📎 Чек',`Распознано ${receipt.items.length} позиций на ${receipt.total} ${receipt.currency||user.preferred_currency||'RUB'}.`);
+ await say(chat,`🧾 Чек распознан: ${receipt.items.length} позиций, ${receipt.total} ${receipt.currency||user.preferred_currency||'RUB'}. Проверь сумму и добавь весь чек одним нажатием.`,{reply_markup:{inline_keyboard:[[{text:'＋ Добавить все',callback_data:`r:ok:${id}`}]]}});
+ return true;
+}
 async function message(pool,update){
   const m=update.message;if(!isPrivate(m))return;
   const user=await ensureUser(pool,m.from),chat=m.chat.id;
-  if(m.text==='/start'||m.text==='/help'){await say(chat,'SkillUp — твой помощник по целям и финансам. Напиши вопрос, отправь голосовое или попробуй:\n«Потратил 1250 на продукты»\n«Получил зарплату 45000»\n«Как мой прогресс за 7 дней?»\nФинансовые записи добавляются только после подтверждения.');return;}
+  if(await handleMediaMessage(pool,user,chat,m,update.update_id))return;
+  if(m.text==='/start'||m.text==='/help'){await say(chat,'SkillUp — твой помощник по целям и финансам. Напиши вопрос, отправь голосовое или попробуй:\n«Потратил 1250 на продукты»\n«Получил зарплату 45000»\n«Как мой прогресс за 7 дней?»\nПонятные финансовые записи сохраняются сразу; ошибочную операцию можно отменить. Фото чеков принимаю тоже.');return;}
   if(m.text==='/cancel'){await pool.query("UPDATE bot_finance_drafts SET status='cancelled' WHERE user_id=$1 AND status='pending'",[user.id]);await say(chat,'Все неподтверждённые записи отменены.');return;}
   let text=m.text;
   if(m.voice){
@@ -133,8 +203,11 @@ async function message(pool,update){
     await say(chat,`🎙 Распознал: ${text}`);
   }
   if(!text)return;
-  const classified=classifyFinance(text);
-  if(classified){await prepareFinance(pool,user,chat,text,classified);return;}
+  const parsed=parseFinanceIntent(text,user.preferred_currency||'RUB');
+  if(parsed){
+    const saved=await appendFinance(pool,user,[parsed],`bot:${update.update_id}`,'telegram_bot');
+    const answer=financeReply(parsed,saved.entries);await recordBotChat(pool,user,update.update_id,text,answer);await say(chat,answer,{reply_markup:{inline_keyboard:[[{text:'↶ Отменить',callback_data:`u:${update.update_id}`}]]}});return;
+  }
   await chatWithClaude(pool,user,chat,text);
 }
 export async function acceptTelegramWebhook(req,res,pool){
