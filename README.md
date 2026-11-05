@@ -1,41 +1,47 @@
-# SkillUp v29.3 / existing Railway API, version 0.3.0
+# SkillUp v29.4 — Telegram Bot + Claude + OpenAI Whisper
 
-This is an **in-place extension** of SkillUp API v0.2.1-authfix. Do NOT deploy as a separate API. Do NOT delete/reset PostgreSQL.
+Это **обновление существующего `skillup-api`** (на базе v29.3), а не новый сервис или новая БД.
 
-## Install
+Встроены:
+- Один общий чат с Claude для Telegram Mini App и обычной переписки с Telegram-ботом — общая таблица `ai_messages`.
+- Голосовые Telegram-сообщения → OpenAI `whisper-1` → обычное сообщение/финансовая операция.
+- Расходы/доходы через бота, обязательное подтверждение каждой операции кнопкой. Запись идёт в **тот же** документ `user_documents(kind='finances')`, что синхронизируется с Mini App. Ревизия обновляется транзакционно.
+- `bot_updates` для уникальности Telegram update_id и повторов, `bot_finance_drafts` для подтверждения.
+- Уменьшены ответы Claude (вместо длинных отчётов — 2–4 предложения или до 3 пунктов).
 
-1. Back up your `skillup-api` GitHub repository branch and database.
-2. Copy files from this package **into the existing `skillup-api` repository** (root: Dockerfile, `package.json`, `src/`, `sql/`, `tests/`). Keep Railway service and existing environment variables.
-3. In Railway → `skillup-api` → Variables add `ANTHROPIC_API_KEY` from Anthropic Console; optionally `ANTHROPIC_MODEL=claude-sonnet-5`. Do not share or commit the key. `DATABASE_URL`, `TELEGRAM_BOT_TOKEN` and `CORS_ORIGINS` remain as currently configured. `CORS_ORIGINS` should include the exact HTTPS frontend origin.
-4. Deploy API **before** deploying updated frontend. SQL `002_ai_single_chat.sql` runs automatically at startup through the **existing** migration engine. It only creates `ai_messages` and indexes.
-5. Verify `GET /` reports `version: 0.3.0-single-ai` and `/health` reports `database: connected`.
-6. Update the separate frontend repository with the `SkillUp_v29_3_FRONTEND.zip` contents.
+## Перед развёртыванием
+1. Создай backup действующей базы PostgreSQL и коммит текущего API.
+2. Распакуй пакет **в существующий** GitHub-репозиторий `skillup-api` с заменой файлов. Не добавляй отдельный Railway service и не меняй `DATABASE_URL`.
+3. Railway → `skillup-api` → Variables:
+   - оставить `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`, `ANTHROPIC_API_KEY`, `CORS_ORIGINS`;
+   - добавить `OPENAI_API_KEY` (создать на https://platform.openai.com/api-keys);
+   - добавить `TRANSCRIPTION_MODEL=whisper-1` (временно; эта модель помечена на вывод из эксплуатации, для будущего перехода допустимо `gpt-transcribe`);
+   - добавить `TELEGRAM_WEBHOOK_SECRET` — **случайная строка 32–64 символа A-Za-z0-9_-**, без пробелов;
+   - добавить `PUBLIC_API_BASE_URL=https://skillup-api-production-3d6c.up.railway.app`;
+   - добавить `TELEGRAM_WEBHOOK_AUTO_REGISTER=true` **только после проверки, что у этого бота нет другого используемого webhook**;
+   - при необходимости `DEFAULT_TIMEZONE=Asia/Bishkek`.
+4. Убедись, что Railway успешно запустил миграцию `003_telegram_bot.sql`. `/health` должен отвечать `database:connected`, корень — `version:0.3.1-telegram-bot`.
+5. После добавления `TELEGRAM_WEBHOOK_AUTO_REGISTER=true` и redeploy в логах должно быть `[Telegram bot] webhook registered`.
 
-## Endpoints
+**Осторожно:** `setWebhook` переключает *того же Telegram-бота* на обработчик SkillUp API. Если у бота уже есть другой работающий сервер или `getUpdates`-polling, они перестанут получать сообщения. При существующем webhook сначала согласовать миграцию. Кнопка Main App в BotFather продолжит открывать SkillUp.
 
-- `GET /api/v1/ai/history` — last 100 messages for **the signed Telegram user**, chronological order.
-- `POST /api/v1/ai/chat` — `{message:string, requestId: UUID, focusItemId?:string}`. Returns `{answer}`. All AI requests use `X-Telegram-Init-Data`; timezone can be sent via `X-SkillUp-Timezone`.
-- `POST /api/v1/ai/import-legacy` — explicit `confirmed:true`, max 250 old messages; deduplicates by digest. **Not automatic**.
-- The pre-existing `/api/v1/me` and `/api/v1/documents/...` are unchanged.
+## Фронтенд
+Пакет `SkillUp_v29_4_FRONTEND.zip` добавляет доходную категорию **«Прочие доходы»** (чтобы продажи и возвраты не назывались зарплатой), и содержит исправленный Dockerfile, копирующий `skillup-ai.js` и `skillup-cloud.js` в Nginx. Существующий рабочий дизайн v29.3 не меняется.
 
-## Agent
+Deploy фронтенда после API. Не загружай `localStorage.json` или другие файлы с личными данными в публичный GitHub.
 
-- Uses the existing `user_documents.kind='development'` in PostgreSQL as the ONLY source of goals and completion history.
-- Context and ownership are resolved from the **server authenticated user**, never from a caller-provided owner or client-provided history.
-- Claude Messages API. Read-only tools `list_goals`, `get_progress_report` (7/30/90 days). No tools that create or edit plans. Suggestions are text drafts only.
-- Does not give full lessons, invent source links, or mix in personal finances.
-- Server limits: 12 actual prompts per 15 minutes, 50 per day per user; at most 3 provider tool rounds, max 950 output tokens each round. Last 18 messages sent to model. Provider timeout 45 seconds.
-- A model failure leaves database chat unchanged; network retry uses request UUID for idempotent save.
-- Prior v29 local notes remain in `localStorage` and backups. Old chats can be copied into this one history only after user confirmation.
+## Проверка
+- `/start` → короткая инструкция.
+- Отправь `Потратил 40 тысяч на продукты` → бот предлагает «Расход 40 000 ₽, Продукты» → нажми ✅ → перезапусти Mini App → Финансы → операция видна.
+- Отправь `Продал телефон за сорок тысяч` → «Доход 40 000 ₽, Прочие доходы» → ✅ → в Mini App появляется доход.
+- Отправь голосом `Купил шкаф за 15 тысяч рублей` → расшифровка и подтверждение → Финансы.
+- Отправь `Как мои цели за неделю?` → Claude отвечает коротко. История этого сообщения появляется в едином чате Mini App после обновления.
+- Повторное нажатие «Сохранить» не создаёт дубль.
 
-## Test locally
-
-```bash
-node --check src/server.js
-node --check src/ai.js
-node --check src/ai-routes.js
-node tests/auth.test.mjs
-node --test tests/ai.test.mjs tests/ai-routes.test.mjs
-```
-
-**What is not yet implemented:** automatic creation/editing of goals by the model (needs proposal/review/apply workflow), cloud note editor, full progress snapshots, external web search, real subscriptions and push reminders. Live Anthropic request, production migration and iOS tests must be verified after deployment.
+## Ограничения / безопасность
+- Доступны **личные** чаты Telegram, не группы.
+- Суммы пока только в рублях, как в текущем интерфейсе SkillUp. Указанные сомы или доллары не записываются без явной поддержки валют.
+- Не менять `finance_transactions` напрямую: Mini App пока использует документ `finances` и собственную ревизию. При одновременном редактировании ботом и открытом Mini App возможен HTTP 409 — это защита от перезаписи; обнови приложение с сервера и проверь локальный резерв перед повтором.
+- Голос до 2 минут, файл до 20 МБ. Транскрипция отправляется в OpenAI; разговор с Claude — в Anthropic. Не отправлять секреты в Telegram/репозиторий.
+- `whisper-1` объявлен deprecated с отключением **26 февраля 2027 года**: планируй переход на `gpt-transcribe`.
+- **Деплой/реальные запросы не тестировались:** локально прошли тесты парсинга, проверки подписи и существующего ИИ; требуются тесты webhook/Telegram/Railway с настоящими ключами.

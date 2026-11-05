@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { Pool } from 'pg';
 import { handleAiRoute } from './ai-routes.js';
+import {acceptTelegramWebhook,processTelegramUpdates,registerWebhookIfEnabled} from './bot.js';
 
 const port = Number(process.env.PORT || 3000);
 const pool = process.env.DATABASE_URL ? new Pool({
@@ -123,7 +124,11 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(204, {...cors, 'access-control-allow-methods':'GET, POST, PUT, OPTIONS', 'access-control-allow-headers':'X-Telegram-Init-Data, X-SkillUp-Timezone, Content-Type', 'access-control-max-age':'600'});
       res.end(); return;
     }
-    if (req.method === 'GET' && pathname === '/') return json(res, 200, {service:'skillup-api', version:'0.3.0-single-ai', status:ready ? 'ready' : 'starting'}, cors);
+    if (req.method === 'POST' && pathname === '/api/v1/telegram/webhook') {
+      if (!ready) return json(res,503,{error:'Not ready'});
+      return acceptTelegramWebhook(req,res,pool);
+    }
+    if (req.method === 'GET' && pathname === '/') return json(res, 200, {service:'skillup-api', version:'0.3.1-telegram-bot', status:ready ? 'ready' : 'starting'}, cors);
     if (req.method === 'GET' && pathname === '/health') {
       if (!ready) return json(res, 503, {status:'unavailable'}, cors);
       try { await pool.query('SELECT 1'); return json(res, 200, {status:'ok', database:'connected'}, cors); }
@@ -174,7 +179,7 @@ const server = http.createServer(async (req, res) => {
 });
 server.listen(port, '0.0.0.0', async () => {
   console.log(`SkillUp API listening on port ${port}`);
-  try { await migrate(); ready = true; console.log('Database ready'); }
+  try { await migrate(); ready = true; console.log('Database ready'); setInterval(()=>void processTelegramUpdates(pool),5000).unref(); await registerWebhookIfEnabled().catch(e=>console.error('[Telegram bot] webhook setup failed',e.message)); }
   catch (error) { console.error('Database initialization failed:', error.message); process.exitCode = 1; server.close(); }
 });
 for (const signal of ['SIGTERM','SIGINT']) process.on(signal, async () => {server.close(); await pool?.end(); process.exit(0);});

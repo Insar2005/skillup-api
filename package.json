@@ -1,13 +1,14 @@
 {
   "name": "skillup-api",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
     "check": "node --check src/server.js",
     "test:auth": "node tests/auth.test.mjs",
-    "test:ai": "node --test tests/ai.test.mjs"
+    "test:ai": "node --test tests/ai.test.mjs",
+    "test:bot": "node --test tests/bot.test.mjs"
   },
   "dependencies": {
     "pg": "^8.13.3"
