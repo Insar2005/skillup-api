@@ -17,7 +17,7 @@ export function parseFinanceIntent(text, defaultCurrency='RUB'){
  if(/[?？]/.test(t)||/^(сколько|как|почему|что мне|отч[её]т|покажи|подсчитай|проанализируй|можно ли|хочу)/iu.test(t))return null;
  const income=/(?:получил|заработал|зарплат|аванс|поступил|пришли деньги|преми|продал|выручк|доход)/iu.test(t);
  const expense=/(?:купил|купила|потратил|потратила|оплатил|оплатила|заплатил|заплатила|взял|заказал|расход|списал|обедал|ужинал|завтракал|(?:выпил|поел)[^.!?\n]{0,40}(?:в кафе|в ресторане|в столовой))/iu.test(t);
- const shorthand=/^(?:\s*\d[\d\s.,]*(?:\s*(?:сом|сомов|₽|руб|доллар|usd|kgs|евро|eur))?\s+на\s+.{2,})$/iu.test(t);
+ const shorthand=/^(?:\s*\d[\d\s.,]*(?:\s*(?:сом|сомов|₽|руб(?:лей|ля)?|доллар(?:ов)?|usd|kgs|евро|eur))?\s+(?:на|за)\s+.{2,})$/iu.test(t);
  if(income&&expense)return null;
  if(!income&&!expense&&!shorthand)return null;
  const amount=extractAmount(t);if(!Number.isSafeInteger(amount)||amount<=0||amount>9999999999)return null;

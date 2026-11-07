@@ -1,3 +1,4 @@
+import {dispatchSkillUpAction} from './agent-dispatch.js';
 import {executeAgentAction} from './agent-actions.js';
 import {parseFinanceIntent,appendFinance,financeReply,restoreLastFinance,financeCorrectionIntent,restoredFinanceReply} from './ai-finance.js';
 import {handleAiMediaRoute} from './ai-media.js';
@@ -24,55 +25,17 @@ export async function handleAiRoute({req,res,pathname,pool,user,cors,readJsonBod
 
     busyUsers.add(id);
     try {
-      // Fast deterministic path. A clear finance statement is saved immediately;
-      // Claude is used only for ambiguous wording or general discussion.
-      // Mutating commands never go to Claude. They use user-scoped DB transactions.
-      const directAction=await executeAgentAction(pool,user,body.message,{key:`chat:${body.requestId}`,timezone:req.headers?.['x-skillup-timezone']||'Asia/Bishkek'});
-      if(directAction){
-        const answer=directAction.text;
+      // All writes and undo requests use the same backend gateway as Telegram.
+      const outcome=await dispatchSkillUpAction({pool,user,text:body.message,key:`chat:${body.requestId}`,timezone:req.headers?.['x-skillup-timezone']||'Asia/Bishkek'});
+      if(outcome){
+        const answer=outcome.answer;
         const c=await pool.connect();
         try {await c.query('BEGIN');
-          const u=await c.query('INSERT INTO ai_messages(user_id,role,content,request_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id',[id,'user',body.message.trim(),body.requestId]);
-          if(u.rowCount)await c.query('INSERT INTO ai_messages(user_id,role,content,reply_to) VALUES($1,$2,$3,$4)',[id,'assistant',answer,body.requestId]);
+          const added=await c.query('INSERT INTO ai_messages(user_id,role,content,request_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id',[id,'user',body.message.trim(),body.requestId]);
+          if(added.rowCount)await c.query('INSERT INTO ai_messages(user_id,role,content,reply_to) VALUES($1,$2,$3,$4)',[id,'assistant',answer,body.requestId]);
           await c.query('COMMIT');
         }catch(e){await c.query('ROLLBACK').catch(()=>{});throw e;}finally{c.release();}
-        return json(res,200,{answer,agentAction:true,developmentChanged:directAction.changed,financeChanged:directAction.changed},cors);
-      }
-      const dev=await handleDevelopmentText(pool,user,body.message);
-      if(dev){
-        const answer=dev.text;
-        const c=await pool.connect();
-        try {await c.query('BEGIN');
-          const u=await c.query('INSERT INTO ai_messages(user_id,role,content,request_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id',[id,'user',body.message.trim(),body.requestId]);
-          if(u.rowCount)await c.query('INSERT INTO ai_messages(user_id,role,content,reply_to) VALUES($1,$2,$3,$4)',[id,'assistant',answer,body.requestId]);
-          await c.query('COMMIT');
-        }catch(e){await c.query('ROLLBACK').catch(()=>{});throw e;}finally{c.release();}
-        return json(res,200,{answer,developmentAction:true,developmentChanged:!!(dev.deleted||dev.restored),pending:!!dev.pending},cors);
-      }
-      const pref=await pool.query('SELECT preferred_currency FROM users WHERE id=$1',[id]);
-      if(financeCorrectionIntent(body.message)==='restore'){
-        const restored=await restoreLastFinance(pool,user);
-        const answer=restored?restoredFinanceReply(restored.entry):'За последние 24 часа отменённых операций для восстановления не найдено.';
-        const c=await pool.connect();
-        try {await c.query('BEGIN');
-          const u=await c.query('INSERT INTO ai_messages(user_id,role,content,request_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id',[id,'user',body.message.trim(),body.requestId]);
-          if(u.rowCount)await c.query('INSERT INTO ai_messages(user_id,role,content,reply_to) VALUES($1,$2,$3,$4)',[id,'assistant',answer,body.requestId]);
-          await c.query('COMMIT');
-        }catch(e){await c.query('ROLLBACK').catch(()=>{});throw e;}finally{c.release();}
-        return json(res,200,{answer,financeRestored:!!restored},cors);
-      }
-      const transaction=parseFinanceIntent(body.message,pref.rows[0]?.preferred_currency||'RUB');
-      if(transaction){
-        const categorized=await enrichFinanceCategory(transaction,body.message);
-        const saved=await appendFinance(pool,user,[categorized],`chat:${body.requestId}`,'chat');
-        const answer=saved.added?financeReply(categorized,saved.entries):'Эта операция уже была обработана. Повторно не записывал.';
-        const c=await pool.connect();
-        try {await c.query('BEGIN');
-          const u=await c.query('INSERT INTO ai_messages(user_id,role,content,request_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id',[id,'user',body.message.trim(),body.requestId]);
-          if(u.rowCount)await c.query('INSERT INTO ai_messages(user_id,role,content,reply_to) VALUES($1,$2,$3,$4)',[id,'assistant',answer,body.requestId]);
-          await c.query('COMMIT');
-        }catch(e){await c.query('ROLLBACK').catch(()=>{});throw e;}finally{c.release();}
-        return json(res,200,{answer,financeSaved:true},cors);
+        return json(res,200,{answer,agentAction:true,financeChanged:outcome.changed==='finances',developmentChanged:outcome.changed==='development',pending:!!outcome.pending},cors);
       }
 
     if(!process.env.ANTHROPIC_API_KEY)return json(res,503,{error:'ai_unconfigured',message:'ИИ временно недоступен; операции и их восстановление продолжают работать.'},cors);

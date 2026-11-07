@@ -1,3 +1,4 @@
+import {dispatchSkillUpAction} from './agent-dispatch.js';
 import {executeAgentAction} from './agent-actions.js';
 import {parseFinanceIntent,appendFinance,financeReply,undoFinanceExternal,restoreFinanceExternal,restoreLastFinance,financeCorrectionIntent,restoredFinanceReply} from './ai-finance.js';
 import {inspectReceiptMedia,saveReceiptDraft,commitReceiptDraft,undoReceiptDraft} from './ai-media.js';
@@ -231,34 +232,22 @@ async function message(pool,update){
     await say(chat,`🎙 Распознал: ${text}`);
   }
   if(!text)return;
-  const directAction=await executeAgentAction(pool,user,text,{key:`bot:${update.update_id}`,timezone:'Asia/Bishkek'});
-  if(directAction){
-    await recordBotChat(pool,user,update.update_id,text,directAction.text);
-    await say(chat,directAction.text);
+  const outcome=await dispatchSkillUpAction({pool,user,text,key:`bot:${update.update_id}`,timezone:'Asia/Bishkek'});
+  if(outcome){
+    await recordBotChat(pool,user,update.update_id,text,outcome.answer);
+    let extra={};
+    if(outcome.kind==='development'){
+      const d=outcome;
+      if(d.pending)extra={reply_markup:{inline_keyboard:[[{text:`Удалить ${d.pending.count} целей`,callback_data:`dg:ok:${d.pending.id}`},{text:'Оставить',callback_data:`dg:no:${d.pending.id}`}]]}};
+      else if(d.archiveId)extra={reply_markup:{inline_keyboard:[[{text:'↷ Восстановить',callback_data:`dg:restore:${d.archiveId}`}]]}};
+    }else if(outcome.kind==='finance' && outcome.committed){
+      extra={reply_markup:{inline_keyboard:[[{text:'↶ Отменить',callback_data:`u:${update.update_id}`}]]}};
+    }else if(outcome.kind==='restore' && outcome.restored){
+      const m=/^bot:(\d+):0$/.exec(outcome.restored.externalId);
+      if(m)extra={reply_markup:{inline_keyboard:[[{text:'↶ Отменить',callback_data:`u:${m[1]}`}]]}};
+    }
+    await say(chat,outcome.answer,extra);
     return;
-  }
-  const dev=await handleDevelopmentText(pool,user,text);
-  if(dev){
-    await recordBotChat(pool,user,update.update_id,text,dev.text);
-    const menu=dev.pending?{inline_keyboard:[[{text:`Удалить ${dev.pending.count} целей`,callback_data:`dg:ok:${dev.pending.id}`},{text:'Оставить',callback_data:`dg:no:${dev.pending.id}`}]]}:
-      dev.archiveId?{inline_keyboard:[[{text:'↷ Восстановить',callback_data:`dg:restore:${dev.archiveId}`}]]}:null;
-    await say(chat,dev.text,menu?{reply_markup:menu}:{});return;
-  }
-  if(financeCorrectionIntent(text)==='restore'){
-    const restored=await restoreLastFinance(pool,user);
-    const answer=restored?restoredFinanceReply(restored.entry):'За последние 24 часа нет отменённой операции, которую можно восстановить. Если расход отменён до обновления бота, запиши его повторно.';
-    await recordBotChat(pool,user,update.update_id,text,answer);
-    const match=restored&&/^bot:(\d+):0$/.exec(restored.externalId);
-    await say(chat,answer,match?{reply_markup:{inline_keyboard:[[{text:'↶ Отменить',callback_data:`u:${match[1]}`}]]}}:{});
-    return;
-  }
-  const parsed=parseFinanceIntent(text,user.preferred_currency||'RUB');
-  if(parsed){
-    const categorized=await enrichFinanceCategory(parsed,text);
-    const saved=await appendFinance(pool,user,[categorized],`bot:${update.update_id}`,'telegram_bot');
-    const answer=saved.added?financeReply(categorized,saved.entries):'Эта операция уже была обработана. Повторно не записывал.';
-    await recordBotChat(pool,user,update.update_id,text,answer);
-    await say(chat,answer,saved.added?{reply_markup:{inline_keyboard:[[{text:'↶ Отменить',callback_data:`u:${update.update_id}`}]]}}:{});return;
   }
   await chatWithClaude(pool,user,chat,text);
 }
