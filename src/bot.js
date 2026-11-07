@@ -158,8 +158,8 @@ async function callback(pool,update){
   await telegram('answerCallbackQuery',{callback_query_id:cb.id,text:answer.slice(0,200),show_alert:m[1]==='ok'});
   if(m[1]==='ok'||m[1]==='no')await say(cb.message.chat.id,answer);
 }
-async function chatWithClaude(pool,user,chat,text){
-  if(!process.env.ANTHROPIC_API_KEY){await say(chat,'Claude пока не подключён. Добавь ANTHROPIC_API_KEY в Railway.');return;}
+async function chatWithClaude(pool,user,chat,text,updateId){
+  if(!(process.env.AI_PROVIDER==='openai'?process.env.OPENAI_API_KEY:process.env.ANTHROPIC_API_KEY)){await say(chat,'ИИ временно недоступен.');return;}
   if(!validateInputMessage(text)){await say(chat,'Сообщение слишком длинное. Напиши короче (до 1500 символов).');return;}
   const reqId=crypto.randomUUID();
   const [hist,dev]=await Promise.all([
@@ -168,7 +168,7 @@ async function chatWithClaude(pool,user,chat,text){
   ]);
   const ctrl=new AbortController();const timeout=setTimeout(()=>ctrl.abort(),45000);
   let answer;
-  try{answer=await generateAgentAnswer({message:text,history:hist.rows.reverse(),development:dev.rows[0]?.payload||{areas:[],items:[]},timezone:process.env.DEFAULT_TIMEZONE||'Asia/Bishkek',signal:ctrl.signal});}
+  try{answer=await generateAgentAnswer({message:text,history:hist.rows.reverse(),development:dev.rows[0]?.payload||{areas:[],items:[]},timezone:process.env.DEFAULT_TIMEZONE||'Asia/Bishkek',signal:ctrl.signal,pool,user,key:`bot:${updateId}`});}
   finally{clearTimeout(timeout);}
   const client=await pool.connect();
   try{await client.query('BEGIN');
@@ -176,7 +176,8 @@ async function chatWithClaude(pool,user,chat,text){
     await client.query('INSERT INTO ai_messages(user_id,role,content,reply_to) VALUES($1,$2,$3,$4)',[user.id,'assistant',answer,reqId]);
     await client.query('COMMIT');
   }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
-  await say(chat,answer);
+  const financeSaved=process.env.AI_PROVIDER==='openai'?await pool.query("SELECT 1 FROM finance_action_history WHERE user_id=$1 AND external_id=$2 AND state='active'",[user.id,`bot:${updateId}:0`]):{rowCount:0};
+  await say(chat,answer,financeSaved.rowCount?{reply_markup:{inline_keyboard:[[{text:'↶ Отменить',callback_data:`u:${updateId}`}]]}}:{});
 }
 async function recordBotChat(pool,user,updateId,text,answer){
  const hex=crypto.createHash('sha256').update('bot:'+updateId).digest('hex');
@@ -249,7 +250,7 @@ async function message(pool,update){
     await say(chat,outcome.answer,extra);
     return;
   }
-  await chatWithClaude(pool,user,chat,text);
+  await chatWithClaude(pool,user,chat,text,update.update_id);
 }
 export async function acceptTelegramWebhook(req,res,pool){
   const secret=req.headers['x-telegram-bot-api-secret-token'];

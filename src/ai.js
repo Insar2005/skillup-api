@@ -1,3 +1,4 @@
+import {generateOpenAIAnswer} from './openai-agent.js';
 import crypto from 'node:crypto';
 
 const safeText = (x,n=150) => String(x??'').slice(0,n).replace(/[\x00-\x08\x0b-\x1f]/g,' ');
@@ -78,7 +79,8 @@ async function anthropicRequest(body,signal){
   if(!response.ok){const error=new Error('AI provider failed');error.code=response.status===429?'model_rate_limited':'model_unavailable';error.status=response.status===429?429:502;throw error;}
   return data;
 }
-export async function generateAgentAnswer({message,history,development,timezone='UTC',focusItemId='',signal,provider=anthropicRequest,now=new Date()}){
+export async function generateAgentAnswer({message,history,development,timezone='UTC',focusItemId='',signal,provider=anthropicRequest,now=new Date(),pool,user,key}){
+  if(process.env.AI_PROVIDER==='openai')return generateOpenAIAnswer({message,history,development,timezone,pool,user,key,signal});
   const context=buildAgentContext(development,timezone,now,focusItemId);
   const model=process.env.ANTHROPIC_MODEL||'claude-sonnet-5-5';
   // Never send financial documents, Telegram identifiers, token or client-supplied history.
