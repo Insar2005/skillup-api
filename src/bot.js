@@ -21,6 +21,23 @@ export async function telegram(method,data){
   if(!r.ok||!body.ok)throw new Error(`Telegram ${method}: HTTP ${r.status}`);
   return body.result;
 }
+// Telegram Bot API chat actions expire after about five seconds. Keep the real
+// activity indicator alive while the queued update is being processed.
+export async function withTelegramActivity(chatId, action, operation, sender=telegram){
+  if(typeof operation!=='function')throw new TypeError('operation required');
+  const valid=new Set(['typing','upload_photo','upload_document','upload_voice','record_voice']);
+  if(!valid.has(action))throw new Error('Unsupported Telegram chat action');
+  let active=true;
+  const notify=()=>{
+    try{Promise.resolve(sender('sendChatAction',{chat_id:chatId,action})).catch(()=>{});}catch{}
+  };
+  notify();
+  const timer=setInterval(()=>{if(active)notify();},4000);
+  timer.unref?.();
+  try{return await operation();}
+  finally{active=false;clearInterval(timer);}
+}
+
 async function say(chat_id,text,extra={}){
   // Do not truncate replies in the middle of a sentence. Normal replies are short;
   // explicit long reports are split at paragraph / sentence / whitespace boundaries.
@@ -276,7 +293,11 @@ export async function processTelegramUpdates(pool){
         AND attempts<3 RETURNING payload,update_id`);
       if(!r.rowCount)break;
       const u=r.rows[0];
-      try{if(u.payload.callback_query)await callback(pool,u.payload);else await message(pool,u.payload);
+      try{
+        const chatId=u.payload.callback_query?.message?.chat?.id||u.payload.message?.chat?.id;
+        const action=()=>u.payload.callback_query?callback(pool,u.payload):message(pool,u.payload);
+        if(Number.isSafeInteger(chatId))await withTelegramActivity(chatId,'typing',action);
+        else await action();
         await pool.query("UPDATE bot_updates SET status='done' WHERE update_id=$1",[u.update_id]);
       }catch(e){console.error('[Telegram bot] failed',u.update_id,String(e?.message||e).slice(0,120));
         await pool.query("UPDATE bot_updates SET status=CASE WHEN attempts>=3 THEN 'done' ELSE 'pending' END WHERE update_id=$1",[u.update_id]);}
