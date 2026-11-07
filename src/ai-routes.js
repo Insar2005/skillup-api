@@ -26,7 +26,9 @@ export async function handleAiRoute({req,res,pathname,pool,user,cors,readJsonBod
     busyUsers.add(id);
     try {
       // All writes and undo requests use the same backend gateway as Telegram.
-      const outcome=await dispatchSkillUpAction({pool,user,text:body.message,key:`chat:${body.requestId}`,timezone:req.headers?.['x-skillup-timezone']||'Asia/Bishkek'});
+      const useLegacyGateway=process.env.AGENT_V2!=='true'||/^(?:удали\s+(?:все|всех)|верни|восстанови|отмени)/iu.test(body.message.trim());
+      const protectedText=/^удали\s+все\s+(?:четыре|4)\s+цели[.!]?$/iu.test(body.message.trim())?'Удали все цели':body.message;
+      const outcome=useLegacyGateway?await dispatchSkillUpAction({pool,user,text:protectedText,key:`chat:${body.requestId}`,timezone:req.headers?.['x-skillup-timezone']||'Asia/Bishkek'}):null;
       if(outcome){
         const answer=outcome.answer;
         const c=await pool.connect();
@@ -43,7 +45,7 @@ export async function handleAiRoute({req,res,pathname,pool,user,cors,readJsonBod
     const fifteen=await pool.query("SELECT count(*)::int AS n FROM ai_messages WHERE user_id=$1 AND role='user' AND legacy_key IS NULL AND created_at>now()-interval '15 minutes'",[id]);
     if(count.rows[0].today>=50||fifteen.rows[0].n>=12)return json(res,429,{error:'limit_reached',message:'Лимит запросов: 12 за 15 минут и 50 в сутки.'},cors);
       const [history,doc]=await Promise.all([
-        pool.query('SELECT role,content FROM ai_messages WHERE user_id=$1 ORDER BY created_at DESC,id DESC LIMIT 18',[id]),
+        pool.query('SELECT role,content,created_at FROM ai_messages WHERE user_id=$1 ORDER BY created_at DESC,id DESC LIMIT 18',[id]),
         pool.query("SELECT payload FROM user_documents WHERE user_id=$1 AND kind='development'",[id])
       ]);
       const tz=normalizeTimezone(req.headers['x-skillup-timezone']);
@@ -59,7 +61,7 @@ export async function handleAiRoute({req,res,pathname,pool,user,cors,readJsonBod
         if(added.rowCount)await client.query('INSERT INTO ai_messages(user_id,role,content,reply_to) VALUES ($1,$2,$3,$4)',[id,'assistant',answer,body.requestId]);
         await client.query('COMMIT');
       }catch(e){await client.query('ROLLBACK').catch(()=>{});throw e;}finally{client.release();}
-      const mutation=process.env.AI_PROVIDER==='openai'?await pool.query("SELECT 1 FROM finance_action_history WHERE user_id=$1 AND external_id=$2 AND state='active'",[id,`chat:${body.requestId}:0`]):{rowCount:0};
+      const mutation=await pool.query("SELECT 1 FROM finance_action_history WHERE user_id=$1 AND external_id=$2 AND state='active'",[id,`chat:${body.requestId}:0`]);
       return json(res,200,{answer,financeChanged:mutation.rowCount>0},cors);
     }catch(error){console.error('[AI] generation_failed',error?.code||error?.name||'unknown');const e=safeError(error);return json(res,e.status,{error:e.code,message:e.message},cors);}
     finally{busyUsers.delete(id);}

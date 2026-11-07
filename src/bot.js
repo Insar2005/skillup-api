@@ -180,7 +180,7 @@ async function chatWithClaude(pool,user,chat,text,updateId){
   if(!validateInputMessage(text)){await say(chat,'Сообщение слишком длинное. Напиши короче (до 1500 символов).');return;}
   const reqId=crypto.randomUUID();
   const [hist,dev]=await Promise.all([
-    pool.query('SELECT role,content FROM ai_messages WHERE user_id=$1 ORDER BY id DESC LIMIT 14',[user.id]),
+    pool.query('SELECT role,content,created_at FROM ai_messages WHERE user_id=$1 ORDER BY id DESC LIMIT 14',[user.id]),
     pool.query("SELECT payload FROM user_documents WHERE user_id=$1 AND kind='development'",[user.id])
   ]);
   const ctrl=new AbortController();const timeout=setTimeout(()=>ctrl.abort(),45000);
@@ -193,7 +193,7 @@ async function chatWithClaude(pool,user,chat,text,updateId){
     await client.query('INSERT INTO ai_messages(user_id,role,content,reply_to) VALUES($1,$2,$3,$4)',[user.id,'assistant',answer,reqId]);
     await client.query('COMMIT');
   }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
-  const financeSaved=process.env.AI_PROVIDER==='openai'?await pool.query("SELECT 1 FROM finance_action_history WHERE user_id=$1 AND external_id=$2 AND state='active'",[user.id,`bot:${updateId}:0`]):{rowCount:0};
+  const financeSaved=await pool.query("SELECT 1 FROM finance_action_history WHERE user_id=$1 AND external_id=$2 AND state='active'",[user.id,`bot:${updateId}:0`]);
   await say(chat,answer,financeSaved.rowCount?{reply_markup:{inline_keyboard:[[{text:'↶ Отменить',callback_data:`u:${updateId}`}]]}}:{});
 }
 async function recordBotChat(pool,user,updateId,text,answer){
@@ -250,7 +250,11 @@ async function message(pool,update){
     await say(chat,`🎙 Распознал: ${text}`);
   }
   if(!text)return;
-  const outcome=await dispatchSkillUpAction({pool,user,text,key:`bot:${update.update_id}`,timezone:'Asia/Bishkek'});
+  // v29.9: one AI-first gateway for ordinary messages. Destructive bulk deletion
+  // and undo commands remain on the existing deterministic, audited routes.
+  const useLegacyGateway=process.env.AGENT_V2!=='true'||/^(?:удали\s+(?:все|всех)|верни|восстанови|отмени)/iu.test(text.trim());
+  const protectedText=/^удали\s+все\s+(?:четыре|4)\s+цели[.!]?$/iu.test(text.trim())?'Удали все цели':text;
+  const outcome=useLegacyGateway?await dispatchSkillUpAction({pool,user,text:protectedText,key:`bot:${update.update_id}`,timezone:'Asia/Bishkek'}):null;
   if(outcome){
     await recordBotChat(pool,user,update.update_id,text,outcome.answer);
     let extra={};

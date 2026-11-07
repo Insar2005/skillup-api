@@ -1,3 +1,4 @@
+import {runUnifiedAgent} from './unified-agent.js';
 import {generateOpenAIAnswer} from './openai-agent.js';
 import crypto from 'node:crypto';
 
@@ -80,6 +81,7 @@ async function anthropicRequest(body,signal){
   return data;
 }
 export async function generateAgentAnswer({message,history,development,timezone='UTC',focusItemId='',signal,provider=anthropicRequest,now=new Date(),pool,user,key}){
+  if(process.env.AGENT_V2==='true')return runUnifiedAgent({message,history,development,timezone,pool,user,key,signal});
   if(process.env.AI_PROVIDER==='openai')return generateOpenAIAnswer({message,history,development,timezone,pool,user,key,signal});
   const context=buildAgentContext(development,timezone,now,focusItemId);
   const model=process.env.ANTHROPIC_MODEL||'claude-sonnet-5-5';
