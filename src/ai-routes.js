@@ -1,4 +1,5 @@
 import {dispatchSkillUpAction} from './agent-dispatch.js';
+import {serverFallback} from './agent-fallback.js';
 import {executeAgentAction} from './agent-actions.js';
 import {parseFinanceIntent,appendFinance,financeReply,restoreLastFinance,financeCorrectionIntent,restoredFinanceReply} from './ai-finance.js';
 import {handleAiMediaRoute} from './ai-media.js';
@@ -40,7 +41,7 @@ export async function handleAiRoute({req,res,pathname,pool,user,cors,readJsonBod
         return json(res,200,{answer,agentAction:true,financeChanged:outcome.changed==='finances',developmentChanged:outcome.changed==='development',pending:!!outcome.pending},cors);
       }
 
-    if(!(process.env.AI_PROVIDER==='openai'?process.env.OPENAI_API_KEY:process.env.ANTHROPIC_API_KEY))return json(res,503,{error:'ai_unconfigured',message:'ИИ временно недоступен; операции и их восстановление продолжают работать.'},cors);
+    // If the provider is not configured, serverFallback below handles safe operations.
     const count=await pool.query("SELECT count(*)::int AS n, count(*) FILTER (WHERE created_at>now()-interval '1 day')::int AS today FROM ai_messages WHERE user_id=$1 AND role='user' AND legacy_key IS NULL AND created_at>now()-interval '1 day'",[id]);
     const fifteen=await pool.query("SELECT count(*)::int AS n FROM ai_messages WHERE user_id=$1 AND role='user' AND legacy_key IS NULL AND created_at>now()-interval '15 minutes'",[id]);
     if(count.rows[0].today>=50||fifteen.rows[0].n>=12)return json(res,429,{error:'limit_reached',message:'Лимит запросов: 12 за 15 минут и 50 в сутки.'},cors);
@@ -52,8 +53,17 @@ export async function handleAiRoute({req,res,pathname,pool,user,cors,readJsonBod
       const focusItemId=typeof body.focusItemId==='string'?body.focusItemId.slice(0,90):'';
       const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),45_000);
       let answer;
-      try{answer=await generateAgentAnswer({message:body.message.trim(),history:history.rows.reverse(),development:doc.rows[0]?.payload||{areas:[],items:[]},timezone:tz,focusItemId,signal:controller.signal,pool,user,key:`chat:${body.requestId}`});}
-      finally{clearTimeout(timeout);}
+      const past=history.rows.reverse();
+      let fallbackUsed=false;
+      try{
+        const aiConfigured=process.env.AI_PROVIDER==='openai'?!!process.env.OPENAI_API_KEY:!!process.env.ANTHROPIC_API_KEY;
+        if(!aiConfigured)throw new Error('provider_unconfigured');
+        answer=await generateAgentAnswer({message:body.message.trim(),history:past,development:doc.rows[0]?.payload||{areas:[],items:[]},timezone:tz,focusItemId,signal:controller.signal,pool,user,key:`chat:${body.requestId}`});
+      }catch(e){
+        console.warn('[SkillUp] chat provider unavailable; server fallback',String(e?.name||'error').slice(0,50));
+        const result=await serverFallback({pool,user,message:body.message.trim(),history:past,key:`chat:${body.requestId}`});
+        answer=result.answer;fallbackUsed=true;
+      }finally{clearTimeout(timeout);}
       const client=await pool.connect();
       try{
         await client.query('BEGIN');
@@ -62,7 +72,7 @@ export async function handleAiRoute({req,res,pathname,pool,user,cors,readJsonBod
         await client.query('COMMIT');
       }catch(e){await client.query('ROLLBACK').catch(()=>{});throw e;}finally{client.release();}
       const mutation=await pool.query("SELECT 1 FROM finance_action_history WHERE user_id=$1 AND external_id=$2 AND state='active'",[id,`chat:${body.requestId}:0`]);
-      return json(res,200,{answer,financeChanged:mutation.rowCount>0},cors);
+      return json(res,200,{answer,financeChanged:mutation.rowCount>0,fallback:fallbackUsed},cors);
     }catch(error){console.error('[AI] generation_failed',error?.code||error?.name||'unknown');const e=safeError(error);return json(res,e.status,{error:e.code,message:e.message},cors);}
     finally{busyUsers.delete(id);}
   }

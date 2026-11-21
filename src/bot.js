@@ -1,4 +1,5 @@
 import {dispatchSkillUpAction} from './agent-dispatch.js';
+import {serverFallback} from './agent-fallback.js';
 import {executeAgentAction} from './agent-actions.js';
 import {parseFinanceIntent,appendFinance,financeReply,undoFinanceExternal,restoreFinanceExternal,restoreLastFinance,financeCorrectionIntent,restoredFinanceReply} from './ai-finance.js';
 import {inspectReceiptMedia,saveReceiptDraft,commitReceiptDraft,undoReceiptDraft} from './ai-media.js';
@@ -176,7 +177,6 @@ async function callback(pool,update){
   if(m[1]==='ok'||m[1]==='no')await say(cb.message.chat.id,answer);
 }
 async function chatWithClaude(pool,user,chat,text,updateId){
-  if(!(process.env.AI_PROVIDER==='openai'?process.env.OPENAI_API_KEY:process.env.ANTHROPIC_API_KEY)){await say(chat,'ИИ временно недоступен.');return;}
   if(!validateInputMessage(text)){await say(chat,'Сообщение слишком длинное. Напиши короче (до 1500 символов).');return;}
   const reqId=crypto.randomUUID();
   const [hist,dev]=await Promise.all([
@@ -185,8 +185,16 @@ async function chatWithClaude(pool,user,chat,text,updateId){
   ]);
   const ctrl=new AbortController();const timeout=setTimeout(()=>ctrl.abort(),45000);
   let answer;
-  try{answer=await generateAgentAnswer({message:text,history:hist.rows.reverse(),development:dev.rows[0]?.payload||{areas:[],items:[]},timezone:process.env.DEFAULT_TIMEZONE||'Asia/Bishkek',signal:ctrl.signal,pool,user,key:`bot:${updateId}`});}
-  finally{clearTimeout(timeout);}
+  const history=hist.rows.reverse();
+  try{
+    const aiConfigured=process.env.AI_PROVIDER==='openai'?!!process.env.OPENAI_API_KEY:!!process.env.ANTHROPIC_API_KEY;
+    if(!aiConfigured)throw new Error('provider_unconfigured');
+    answer=await generateAgentAnswer({message:text,history,development:dev.rows[0]?.payload||{areas:[],items:[]},timezone:process.env.DEFAULT_TIMEZONE||'Asia/Bishkek',signal:ctrl.signal,pool,user,key:`bot:${updateId}`});
+  }catch(e){
+    console.warn('[SkillUp] provider unavailable; deterministic fallback',String(e?.name||'error').slice(0,50));
+    const fallback=await serverFallback({pool,user,message:text,history,key:`bot:${updateId}`});
+    answer=fallback.answer;
+  }finally{clearTimeout(timeout);}
   const client=await pool.connect();
   try{await client.query('BEGIN');
     await client.query('INSERT INTO ai_messages(user_id,role,content,request_id) VALUES($1,$2,$3,$4)',[user.id,'user',text,reqId]);
