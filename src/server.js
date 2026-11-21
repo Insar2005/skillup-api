@@ -6,6 +6,7 @@ import path from 'node:path';
 import { Pool } from 'pg';
 import { handleAiRoute } from './ai-routes.js';
 import {acceptTelegramWebhook,processTelegramUpdates,registerWebhookIfEnabled} from './bot.js';
+import { handlePwaAuthRoute, pwaAuthenticatedUser, enforcePwaCsrf } from './pwa-auth.js';
 
 const port = Number(process.env.PORT || 3000);
 const pool = process.env.DATABASE_URL ? new Pool({
@@ -93,7 +94,7 @@ function validateTelegram(initData) {
 
 async function authenticatedUser(req) {
   const telegramUser = validateTelegram(req.headers['x-telegram-init-data']);
-  if (!telegramUser) return null;
+  if (!telegramUser) return pwaAuthenticatedUser(req, pool);
   const result = await pool.query(`INSERT INTO users (telegram_id, first_name, last_name, username, language_code)
     VALUES ($1,$2,$3,$4,$5) ON CONFLICT (telegram_id)
     DO UPDATE SET first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name,
@@ -124,6 +125,10 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(204, {...cors, 'access-control-allow-methods':'GET, POST, PUT, OPTIONS', 'access-control-allow-headers':'X-Telegram-Init-Data, X-SkillUp-Timezone, X-SkillUp-Photo-Prompt, Content-Type', 'access-control-max-age':'600'});
       res.end(); return;
     }
+    if (pathname.startsWith('/api/v1/auth/')) {
+      if (!ready) return json(res, 503, {error:'Not ready'}, cors);
+      if (await handlePwaAuthRoute({req,res,pathname,pool})) return;
+    }
     if (req.method === 'POST' && pathname === '/api/v1/telegram/webhook') {
       if (!ready) return json(res,503,{error:'Not ready'});
       return acceptTelegramWebhook(req,res,pool);
@@ -136,8 +141,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === '/api/v1/me' || pathname === '/api/v1/preferences' || pathname.startsWith('/api/v1/documents/') || pathname.startsWith('/api/v1/ai/')) {
       if (!ready || !process.env.TELEGRAM_BOT_TOKEN) return json(res, 503, {error:'Service not configured'}, cors);
+      const signedMiniApp = Boolean(validateTelegram(req.headers['x-telegram-init-data']));
       const user = await authenticatedUser(req);
-      if (!user) return json(res, 401, {error:'Valid Telegram Mini App authorization required'}, cors);
+      if (!user) return json(res, 401, {error:'Sign in with Telegram required'}, cors);
+      if (!signedMiniApp && !enforcePwaCsrf(req,res)) return;
       if (pathname === '/api/v1/me' && req.method === 'GET') return json(res, 200, {user}, cors);
       if (pathname === '/api/v1/preferences' && req.method === 'GET') {
         const r=await pool.query('SELECT preferred_currency FROM users WHERE id=$1',[user.id]);
